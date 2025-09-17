@@ -1,0 +1,21 @@
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.devnet]
+solanadeads_fee_router = "DEADS3ucNHjN8iz3Cw65joYxgVdguNsjytHRqCs7QvzA"
+
+[programs.localnet]
+solanadeads_fee_router = "DEADS3ucNHjN8iz3Cw65joYxgVdguNsjytHRqCs7QvzA"
+
+[registry]
+url = "https://anchor.projectserum.com"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "anchor test"

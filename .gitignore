@@ -1,0 +1,17 @@
+node_modules/@babel/runtime/helpers/classPrivateFieldGet2.js
+/node_modules
+/target/release/.fingerprint
+/target/release/build
+/target/release/deps
+/target/sbpf-solana-solana
+/docker-target/release/.fingerprint
+/docker-target/release/build
+/docker-target/release/deps
+/docker-target/sbf-solana-solana/release/.fingerprint
+/docker-target/sbf-solana-solana
+/target/debug
+/venv
+/tests
+/edge-functions
+/tests
+/venv
