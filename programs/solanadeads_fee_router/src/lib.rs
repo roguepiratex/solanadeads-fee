@@ -28,20 +28,43 @@ use spl_token_2022::extension::{BaseStateWithExtensions, StateWithExtensions};
 use spl_token_2022::state::Mint as SplMint;
 use std::str::FromStr;
 
+#[cfg(not(feature = "no-entrypoint"))]
+use solana_security_txt::security_txt;
+
 declare_id!("DEADS3ucNHjN8iz3Cw65joYxgVdguNsjytHRqCs7QvzA");
+
+#[cfg(not(feature = "no-entrypoint"))]
+security_txt! {
+    name: "Solana Deads Harvester",
+    project_url: "https://www.solanadeads.com",
+    contacts: "email:admin@solanadeads.com,discord:solanadeads",
+    policy: "https://www.solanadeads.com/security-policy",
+    source_code: "https://github.com/roguepiratex/solanadeads-fee",
+    preferred_languages: "en",
+    auditors: "None"
+}
 
 // ------------------------------ Constants ------------------------------------
 
 pub const SEED_NAMESPACE: &[u8] = b"solanadeads";
-pub const SEED_ROUTER: &[u8] = b"fee-router-v1";
+pub const SEED_ROUTER: &[u8] = b"fee-router-v1";  // Use v1 (already has withdraw authority)
 
 // Hard-set **owner wallets** (cluster-agnostic). Program derives ATAs at runtime.
 pub const TREASURY_OWNER: &str = "26xcb2Ygdj47BSsXTgQf4QHQw38jxMaKbENHyzwkaQA8";
 pub const LP_OWNER: &str = "4zrLoUzDrTSohZ4ay6uuQM5fAPbyPSMi31hTRCaaQx7y";
-pub const STAKERS_OWNER: &str = "DeAdS9A5s2YpLzy4tAwMVTqCAa5HPQ4r1TL2p3CZLeCo";
+
+// The Undertaker Rewards Vault - This is the rewards-vault ATA (Token Account)
+// Vault Authority PDA: 6vLUBJaJoN9YK4jKsTwhMReWyNm9DoWw9Eee1hRZWgDV
+// Vault ATA: 2SHAd8fzBFYnDvK8DBHYQkcjiVtxh2L7ondTQ1ECztFv
+// This vault receives 65% of all harvested fees, which then get distributed to active pools!
+// STAKERS_OWNER is the actual token account (ATA), not the authority
+pub const STAKERS_OWNER: &str = "2SHAd8fzBFYnDvK8DBHYQkcjiVtxh2L7ondTQ1ECztFv";
 
 // Token-2022 DEADS mint (mainnet & devnet)
 pub const DEADS_MINT: &str = "DEADsWJZaonaiZPFkrqEEBGf43mzA5uHeHpwgy9dW666";
+
+// Rewards Program ID (deployed on devnet/mainnet)
+pub const REWARDS_PROGRAM_ID: &str = "DEADZS7SrZMW5aGgXzgUis59iaQfjgdmnXMQuJJo7uAu";
 
 // Splits (basis points)
 pub const STAKERS_BP: u16 = 6500;  // 65.00%
@@ -229,16 +252,24 @@ pub struct HarvestAndDistribute<'info> {
     )]
     pub lp_pool_wallet: InterfaceAccount<'info, TokenAccount>,
 
-    /// CHECK: fixed owner; ATA is derived below
-    #[account(address = Pubkey::from_str(STAKERS_OWNER).unwrap())]
-    pub stakers_owner: UncheckedAccount<'info>,
+    /// CHECK: Rewards vault token account
     #[account(
         mut,
-        associated_token::mint = mint,
-        associated_token::authority = stakers_owner,
-        associated_token::token_program = token_program
+        address = Pubkey::from_str(STAKERS_OWNER).unwrap()
     )]
     pub stakers_wallet: InterfaceAccount<'info, TokenAccount>,
+    
+    // Rewards program accounts for CPI
+    /// CHECK: Vault authority PDA
+    pub vault_authority_pda: UncheckedAccount<'info>,
+    /// CHECK: Rewards program ID
+    pub rewards_program: UncheckedAccount<'info>,
+    /// CHECK: Rewards program config PDA
+    #[account(mut)]
+    pub rewards_config: UncheckedAccount<'info>,
+    /// CHECK: Rewards program pool registry PDA
+    pub pool_registry: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 // ------------------------------ Program --------------------------------------
@@ -329,7 +360,12 @@ pub mod solanadeads_fee_router {
 
         // Sanity-check remaining fee-bearing accounts: correct owner & mint
         // remaining_accounts are just the fee-bearing token accounts (no mint)
-        require!(ctx.remaining_accounts.len() >= 1, RouterError::ZeroAmount);
+        // Allow empty harvests (no-op if no fees to collect)
+        if ctx.remaining_accounts.is_empty() {
+            msg!("No fee-bearing accounts provided - skipping harvest");
+            return Ok(());
+        }
+        
         for acc in ctx.remaining_accounts.iter() {
             require_keys_eq!(
                 *acc.owner,
@@ -380,7 +416,12 @@ pub mod solanadeads_fee_router {
         // 3) Re-read vault AFTER withdraw, then distribute that fresh balance
         ctx.accounts.router_vault.reload()?;
         let amount = ctx.accounts.router_vault.amount;
-        require!(amount >= MIN_DISTRIBUTE, RouterError::ZeroAmount);
+        msg!("Vault balance after withdraw: {} lamports", amount);
+        
+        if amount < MIN_DISTRIBUTE {
+            msg!("Vault balance {} < MIN_DISTRIBUTE {}, skipping distribution", amount, MIN_DISTRIBUTE);
+            return Ok(());
+        }
 
         let decimals_from_mint = ctx.accounts.mint.decimals;
         let fee_params = get_fee_params(&ctx.accounts.mint.to_account_info())?;
@@ -402,6 +443,74 @@ pub mod solanadeads_fee_router {
         // Re-read for `vault_after`
         ctx.accounts.router_vault.reload()?;
         let vault_after = ctx.accounts.router_vault.amount;
+
+        // CPI: Call rewards program's sync_vault_and_distribute
+        // This triggers automatic distribution of deposited rewards to active pools
+        let (stakers_amount, _, _) = compute_splits(amount)?;
+        if stakers_amount > 0 {
+            msg!("Calling rewards program sync_vault_and_distribute via CPI");
+            
+            // Discriminator for sync_vault_and_distribute
+            let discriminator: [u8; 8] = [8, 138, 201, 54, 235, 135, 144, 204];
+            
+            // Empty pool_ids - rewards program will use its own active_pool_ids from config
+            let pool_ids: Vec<u8> = vec![];
+            
+            // Encode instruction data: discriminator + Vec<u8> (length + elements)
+            let mut data = discriminator.to_vec();
+            data.extend_from_slice(&(pool_ids.len() as u32).to_le_bytes());
+            data.extend_from_slice(&pool_ids);
+            
+            // Derive rewards program PDAs
+            let (rewards_config, _) = Pubkey::find_program_address(
+                &[b"rewards-config", ctx.accounts.mint.key().as_ref()],
+                &ctx.accounts.rewards_program.key()
+            );
+            
+            let (pool_registry, _) = Pubkey::find_program_address(
+                &[b"pool-registry-v2", ctx.accounts.mint.key().as_ref()],
+                &ctx.accounts.rewards_program.key()
+            );
+            
+            let (vault_authority_pda, _) = Pubkey::find_program_address(
+                &[b"rewards-vault", ctx.accounts.mint.key().as_ref()],
+                &ctx.accounts.rewards_program.key()
+            );
+            
+            // Accounts: config, pool_registry, mint, vault_authority, vault, token_program, system_program
+            let cpi_accounts = vec![
+                AccountMeta::new(rewards_config, false),
+                AccountMeta::new_readonly(pool_registry, false),
+                AccountMeta::new_readonly(ctx.accounts.mint.key(), false),
+                AccountMeta::new_readonly(vault_authority_pda, false),
+                AccountMeta::new(ctx.accounts.stakers_wallet.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
+            ];
+            
+            let cpi_instruction = anchor_lang::solana_program::instruction::Instruction {
+                program_id: ctx.accounts.rewards_program.key(),
+                accounts: cpi_accounts,
+                data,
+            };
+            
+            let cpi_account_infos = vec![
+                ctx.accounts.rewards_config.to_account_info(),
+                ctx.accounts.pool_registry.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.vault_authority_pda.to_account_info(),
+                ctx.accounts.stakers_wallet.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ];
+            
+            anchor_lang::solana_program::program::invoke(
+                &cpi_instruction,
+                &cpi_account_infos,
+            )?;
+            
+            msg!("✅ Rewards vault synced and distributed via CPI");
+        }
 
         emit!(HarvestRun {
             sources: ctx.remaining_accounts.len() as u32,
@@ -483,6 +592,10 @@ fn maybe_gross_up_splits(
     fee_params: Option<(u16, u64)>,
 ) -> Result<(u64, u64, u64)> {
     if let Some((bps, max_fee)) = fee_params {
+        // Skip gross-up if fee is >= 100% (mathematically impossible)
+        if bps >= 10000 {
+            return Ok((stakers, treasury, lp));
+        }
         let s = gross_up(stakers, bps, max_fee)?;
         let t = gross_up(treasury, bps, max_fee)?;
         let l = gross_up(lp, bps, max_fee)?;

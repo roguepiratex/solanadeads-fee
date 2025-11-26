@@ -2,7 +2,7 @@
   "address": "DEADS3ucNHjN8iz3Cw65joYxgVdguNsjytHRqCs7QvzA",
   "metadata": {
     "name": "solanadeads_fee_router",
-    "version": "0.1.0",
+    "version": "1.0.0",
     "spec": "0.1.0",
     "description": "Solana Deads Fee Router (Token-2022 compatible)"
   },
@@ -580,64 +580,25 @@
           }
         },
         {
-          "name": "stakers_owner"
+          "name": "stakers_wallet",
+          "writable": true
         },
         {
-          "name": "stakers_wallet",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "account",
-                "path": "stakers_owner"
-              },
-              {
-                "kind": "account",
-                "path": "token_program"
-              },
-              {
-                "kind": "account",
-                "path": "mint"
-              }
-            ],
-            "program": {
-              "kind": "const",
-              "value": [
-                140,
-                151,
-                37,
-                143,
-                78,
-                36,
-                137,
-                241,
-                187,
-                61,
-                16,
-                41,
-                20,
-                142,
-                13,
-                131,
-                11,
-                90,
-                19,
-                153,
-                218,
-                255,
-                16,
-                132,
-                4,
-                142,
-                123,
-                216,
-                219,
-                233,
-                248,
-                89
-              ]
-            }
-          }
+          "name": "vault_authority_pda"
+        },
+        {
+          "name": "rewards_program"
+        },
+        {
+          "name": "rewards_config",
+          "writable": true
+        },
+        {
+          "name": "pool_registry"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
         }
       ],
       "args": []
